@@ -43,6 +43,7 @@ def add_piece(stri, obj, num, last_particle=None):
 				particle = particle + stri[i+j:i+j+1]
 			"""
 			j = int(length)
+			"""
 			i = i + j + 1
 			num[0] = num[0] + i
 			#print(stri[i:])

@@ -3,6 +3,7 @@ import socket
 from byte_splitter import split_by_byte
 
 CHUNK_SIZE = 1024
+PIECES_IN_MEMORY = 10
 
 """
 status list:
@@ -10,12 +11,11 @@ status list:
 	1: working
 	2: got b''
 	3: error occured, still working
-	4: sleep
-	5: choked or other error
+	4: choked
+	5: other error
 """
 
 class Peer:
-	unchoked = False
 	reader = None
 	writer = None
 	bitfield = None
@@ -26,7 +26,6 @@ class Peer:
 
 	async def connect(self, handshake):
 		try:
-			#print('connecting to {}'.format((self.ip, self.port)))
 			con = asyncio.open_connection(self.ip, self.port)
 			self.reader, self.writer = await asyncio.wait_for(con, 10)
 			self.writer.write(handshake)
@@ -38,13 +37,11 @@ class Peer:
 
 			"""TO DO: check handshake"""
 
-			# writer.close()
-			# await writer.wait_closed()
 		except Exception as e:
-			self.status = 2
+			self.status = 5
 
 	async def choke(self, i):
-		if self.status in [0, 1, 2, 3, 5]:
+		if self.status in [0, 1, 2, 3, 4, 5]:
 			try:
 				self.writer.write(b'\x00\x00\x00\x01\x02')
 				await self.writer.drain()
@@ -58,17 +55,13 @@ class Peer:
 				cor = self.reader.read(int.from_bytes(length, "big"))
 				data = await asyncio.wait_for(cor, 10)
 
-				#print('choke result {}'.format(i), data)
-				if data[0]==1:
-					self.unchoked = True
-				else:
-					self.status = 2
-				#print('{} unchoked {}'.format(data, (self.ip, self.port)))
-				#await asyncio.wait([self.have(0)])
+				if data[0]!=1:
+					self.status = 4
 			except:
-				self.status = 2
+				self.status = 5
+
 	async def have(self, id=0):
-		if self.status in [0, 1, 2, 3]:
+		if self.status in [0, 1, 2, 3, 4, 5]:
 			try:
 				self.writer.write(bytes(bytearray(b'\x00\x00\x00\x05\x04')+split_by_byte(id, 4)))
 				await self.writer.drain()
@@ -86,13 +79,12 @@ class Peer:
 					self.bitfield = data[1:]
 				if self.bitfield == b'':
 					self.status = 2
-				#print('have request lead to ', data)
-				#await asyncio.wait([self.choke()])
 			except Exception as e:
-				self.status = 2
-	async def request(self, piece_id, start, size, pieces, peers, piece_length, peer_id, status_start, num=3):
-		#print(start, size, peer_id)
+				self.status = 5
+
+	async def request(self, piece_id, size, pieces, status_start, num=3):
 		err = None
+		start = status_start[1]
 		if num == 0:
 			self.status = 3
 			status_start[0] = 3
@@ -103,6 +95,7 @@ class Peer:
 			if self.status == 1 and len(pieces)<=start:
 
 				message = bytes(bytearray(b'\x00\x00\x00\x0d\x06')+split_by_byte(piece_id, 4)+split_by_byte(start, 4)+split_by_byte(size, 4))
+
 				self.writer.write(message)
 				await self.writer.drain()
 				cor = self.reader.read(4)
@@ -118,74 +111,61 @@ class Peer:
 				cor = self.reader.read(int.from_bytes(length, "big"))
 				data = await asyncio.wait_for(cor, 15)
 
-				"""TO DO: Develop check later"""
+				"""TO DO: Develop check"""
 				if len(data)>0:
-					if data[0] != 7 and num > 0:
-						await asyncio.wait([self.request(piece_id, start, size, pieces, peers, piece_length, peer_id, status_start, num-1)])
+					if data[0] != 7:
+						await asyncio.wait([self.request(piece_id, size, pieces, status_start, num-1)])
 						return
 
-					elif len(data)>10 and num > 0:
+					elif len(data)>10:
+						#this should be checked too
 						#and and self.bitfield[int(piece_id/8)] & 2**(7-piece_id%8) > 0
 						if int.from_bytes(data[5:9], "big") == start:
 							if len(pieces)<=start and (len(data[9:]) == size or isEnd):
 
 								pieces += data[9:]
-								print('added {}/{} to {} from {}'.format(len(pieces), piece_length, piece_id, peer_id))
-								"""if start + 1024 >= piece_length:
-									self.status = 0
-								else:
-									await asyncio.wait([peers[peer_id].request(piece_id, start+1024, 1024, pieces, peers, piece_length, peer_id)])"""
-
+								print('added {}'.format(len(pieces)))
 								status_start[0] = 1
-								status_start[1] = start+size
-								#await asyncio.sleep(1)
+								status_start[1] = start + size
 								return
+
 							else:
 								if len(data[9:]) != size:
-									await asyncio.wait([self.request(piece_id, start, size, pieces, peers, piece_length, peer_id, status_start, num-1)])
+									await asyncio.wait([self.request(piece_id, size, pieces, status_start, num-1)])
 									return
 						elif int.from_bytes(data[5:9], "big") != start :
-							await asyncio.wait([self.request(piece_id, start, size, pieces, peers, piece_length, peer_id, status_start, num-1)])
+							await asyncio.wait([self.request(piece_id, size, pieces, status_start, num-1)])
 						else:
 							self.status = 3
-							#print('error in start or map: start={}, data={}'.format(start, int.from_bytes(data[5:9], "big")))
-							"""await asyncio.wait([router(piece_length, peers, peer_id, pieces, piece_id, start, 3)])"""
 							status_start[0] = 3
 							status_start[1] = start
 							return
 					else:
 						if num > 0:
-							await asyncio.wait([self.request(piece_id, start, size, pieces, peers, piece_length, peer_id, status_start, num-1)])
+							await asyncio.wait([self.request(piece_id, size, pieces, status_start, num-1)])
 							return
 						else:
 							self.status = 3
-							#print('num < 0')
 							status_start[0] = 3
 							status_start[1] = start
 							return
 				else:
-					await asyncio.wait([self.request(piece_id, start, size, pieces, peers, piece_length, peer_id, status_start, num-1)])
+					await asyncio.wait([self.request(piece_id, size, pieces, status_start, num-1)])
 					return
 					self.status = 3
-					#print('len data<0 {} but lenght={}'.format(len(data), length))
-					"""await asyncio.wait([router(piece_length, peers, peer_id, pieces, piece_id, start, 3)])"""
 					status_start[0] = 3
 					status_start[1] = start
 					return
 			else:
-				await asyncio.wait([self.request(piece_id, start, size, pieces, peers, piece_length, peer_id, status_start, num-1)])
+				await asyncio.wait([self.request(piece_id, size, pieces, status_start, num-1)])
 				return
 				self.status = 3
-				#print('self.status == 1 {} and len(pieces[arrid]) {} <=start: {}'.format(self.status, len(pieces[arrid]), start))
-				"""await asyncio.wait([router(piece_length, peers, peer_id, pieces, piece_id, start, 3)])"""
 				status_start[0] = 3
 				status_start[1] = start
 				return
 		except Exception as e:
-			self.status = 3
-			#print(e, 'in', peer_id)
-			"""await asyncio.wait([router(piece_length, peers, peer_id, pieces, piece_id, start, 5)])"""
-			status_start[0] = 3
+			self.status = 5
+			status_start[0] = 5
 			status_start[1] = start
 			return
 
@@ -194,48 +174,13 @@ class Peer:
 		await asyncio.wait([self.connect(handshake)])
 		await asyncio.wait([self.have(id)])
 		await asyncio.wait([self.choke(0)])
-		await asyncio.wait([self.choke(0)])
-		await asyncio.wait([self.have(id)])
-		await asyncio.wait([self.choke(0)])
 
 
 
-
-# async def router(piece_length, peers, peer_id, pieces, piece_id, start, status, arrid, isEnd):
-# 	status_start = [status, start]
-# 	while True:
-# 		if status_start[0] == -1:
-# 			peers[peer_id].status = 1
-# 			await asyncio.wait([peers[peer_id].request(piece_id, status_start[1], CHUNK_SIZE, pieces, peers, piece_length, peer_id, status_start, arrid, isEnd)])
-# 		elif status_start[0] == 1:
-# 			if status_start[1] + CHUNK_SIZE > piece_length:
-# 				if isEnd:
-# 					await asyncio.wait([peers[peer_id].request(piece_id, status_start[1], piece_length-status_start[1], pieces, peers, piece_length, peer_id, status_start, arrid, isEnd)])
-# 				else:
-# 					peers[peer_id].status = 0
-# 				break
-# 			else:
-# 				await asyncio.wait([peers[peer_id].request(piece_id, status_start[1], CHUNK_SIZE, pieces, peers, piece_length, peer_id, status_start, arrid, isEnd)])
-# 		else:
-# 			if peer_id == -1:
-# 				peer_id = 0
-# 			else:
-# 				peers[peer_id].status = status_start[0]
-# 			peer_id += 1
-# 			while peer_id < len(peers) and (peers[peer_id].status == 1) :
-# 				peer_id += 1
-# 			if peer_id == len(peers):
-# 				peer_id = -1
-# 				#print('RIP', piece_id, peer_id)
-# 				await asyncio.sleep(10)
-# 				pass
-# 			else:
-# 				peers[peer_id].status = 1
-# 				await asyncio.wait([peers[peer_id].request(piece_id, status_start[1], CHUNK_SIZE, pieces, peers, piece_length, peer_id, status_start, arrid, isEnd)])
 
 async def router(piece_length, peers, peer_id, piece_id, start, status, arrid, files):
-	print(piece_id)
 	isNew = False
+
 	while arrid[piece_id][0] == 1:
 		piece_id += 1
 	if len(arrid) == piece_id+1:
@@ -243,8 +188,8 @@ async def router(piece_length, peers, peer_id, piece_id, start, status, arrid, f
 	arrid[piece_id][0] = 1
 
 	status_start = [status, start]
-	while True:
 
+	while True:
 		while arrid[piece_id][0] == 1 and isNew:
 			piece_id += 1
 		if len(arrid) == piece_id+1:
@@ -254,11 +199,12 @@ async def router(piece_length, peers, peer_id, piece_id, start, status, arrid, f
 
 		if status_start[0] == -1:
 			peers[peer_id].status = 1
-			await asyncio.wait([peers[peer_id].request(piece_id, status_start[1], CHUNK_SIZE, arrid[piece_id][1], peers, piece_length, peer_id, status_start)])
+			await asyncio.wait([peers[peer_id].request(piece_id, CHUNK_SIZE, arrid[piece_id][1], status_start)])
+
 		elif status_start[0] == 1:
 			if status_start[1] + CHUNK_SIZE > piece_length:
 				if len(arrid) == piece_id+1:
-					await asyncio.wait([peers[peer_id].request(piece_id, status_start[1], piece_length-status_start[1], arrid[piece_id][1], peers, piece_length, peer_id, status_start)])
+					await asyncio.wait([peers[peer_id].request(piece_id, piece_length-status_start[1], arrid[piece_id][1], status_start)])
 					return
 				else:
 					peers[peer_id].status = 0
@@ -269,25 +215,17 @@ async def router(piece_length, peers, peer_id, piece_id, start, status, arrid, f
 						await asyncio.sleep(3)
 
 					piece = 0
-					#for piece in arrid[start][1]:
 					"""
-					 TODO: hash sum check
+					 TO DO: hash sum check
 					"""
-					
+
 					for file in files:
 						with open('files/'+file['filename'], 'ab') as f:
-							print(file['downloaded'], file['left'])
-							a = True
 							while file['downloaded'] < file['left'] and piece < len(arrid[piece_id][1]):
-								if a:
-									print(f)
-									a = False
 								f.write(bytes(arrid[piece_id][1][piece:piece+1]))
 								file['downloaded'] += 1
 								piece += 1
 
-					# print(bytes(arrid[piece_id][1]))
-					# print(piece)
 
 					arrid[piece_id][0] = 0
 					arrid[piece_id][1] = b''
@@ -295,33 +233,32 @@ async def router(piece_length, peers, peer_id, piece_id, start, status, arrid, f
 					status_start = [1, 0]
 					print("\n ended ", piece_id, '\n')
 					isNew = True
-					#await asyncio.sleep(10000)
 
 			else:
-				await asyncio.wait([peers[peer_id].request(piece_id, status_start[1], CHUNK_SIZE, arrid[piece_id][1], peers, piece_length, peer_id, status_start)])
+				await asyncio.wait([peers[peer_id].request(piece_id, CHUNK_SIZE, arrid[piece_id][1], status_start)])
 		else:
 			if peer_id == -1:
 				peer_id = 0
 			else:
 				peers[peer_id].status = status_start[0]
+
 			peer_id += 1
+			#working peers might send bad response so i track them as 3 or 5,
+			#but finally i forgive them and allow them to try again
 			while peer_id < len(peers) and (peers[peer_id].status == 1) :
 				peer_id += 1
+
 			if peer_id == len(peers):
 				peer_id = -1
-				#print('RIP', piece_id, peer_id)
 				await asyncio.sleep(10)
 				pass
 			else:
 				peers[peer_id].status = 1
-				await asyncio.wait([peers[peer_id].request(piece_id, status_start[1], CHUNK_SIZE, arrid[piece_id][1], peers, piece_length, peer_id, status_start)])
-
-
+				await asyncio.wait([peers[peer_id].request(piece_id, CHUNK_SIZE, arrid[piece_id][1], status_start)])
 
 
 
 async def setup_download(pairs, handshake, peersd):
-	#print(pairs)
 	peers = [Peer(addr) for addr in pairs]
 	tasks = [asyncio.create_task(obj.setup(handshake, 0, 0, 0)) for obj in peers]
 	await asyncio.wait(tasks)
@@ -330,8 +267,6 @@ async def setup_download(pairs, handshake, peersd):
 
 async def download(peers, piece_length, arrid, files):
 	tasks = [
-		asyncio.create_task(router(piece_length, peers, i, i, 0, -1, arrid, files)) for i in range(10)
+		asyncio.create_task(router(piece_length, peers, i, i, 0, -1, arrid, files)) for i in range(PIECES_IN_MEMORY)
 		]
-	for i in tasks:
-		print(i)
 	await asyncio.wait(tasks)
